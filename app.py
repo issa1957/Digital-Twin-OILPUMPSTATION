@@ -1,380 +1,277 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+import numpy as np
+from datetime import datetime
 
-st.set_page_config(page_title="Libya Oil Digital Twin", layout="wide")
+from sklearn.linear_model import LinearRegression
 
-# ==========================================================
-# ASSET REGISTRY
-# ==========================================================
+# ==============================
+# PAGE CONFIG
+# ==============================
+st.set_page_config(page_title="PS-01 Digital Twin", layout="wide")
 
-DEFAULT_ASSETS = [
-    {
-        "Asset":"P101",
-        "Type":"Pump",
-        "Criticality":0.8,
-        "Temperature":0.60,
-        "Vibration":0.70,
-        "OperatingHours":0.50,
-        "MaintenanceGap":0.40,
-        "Corrosion":0.0,
-        "Pressure":0.0,
-        "Age":0.40
-    },
+st.title("🛢 PS-01 Digital Twin – Asset Integrity & Risk Platform")
 
-    {
-        "Asset":"P102",
-        "Type":"Pump",
-        "Criticality":0.7,
-        "Temperature":0.30,
-        "Vibration":0.40,
-        "OperatingHours":0.30,
-        "MaintenanceGap":0.20,
-        "Corrosion":0.0,
-        "Pressure":0.0,
-        "Age":0.20
-    },
+# ==============================
+# SESSION STATE (HISTORY)
+# ==============================
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-    {
-        "Asset":"T201",
-        "Type":"Tank",
-        "Criticality":1.0,
-        "Temperature":0.0,
-        "Vibration":0.0,
-        "OperatingHours":0.0,
-        "MaintenanceGap":0.50,
-        "Corrosion":0.80,
-        "Pressure":0.0,
-        "Age":0.70
-    },
+# ==============================
+# ASSET REGISTRY (STATIC MODEL)
+# ==============================
+assets = {
+    "P101": {"type": "Pump", "criticality": 4},
+    "P102": {"type": "Pump", "criticality": 4},
+    "PL301": {"type": "Pipeline", "criticality": 5},
+    "T201": {"type": "Tank", "criticality": 4.5},
+    "C401": {"type": "Compressor", "criticality": 5},
+}
 
-    {
-        "Asset":"PL301",
-        "Type":"Pipeline",
-        "Criticality":1.0,
-        "Temperature":0.0,
-        "Vibration":0.0,
-        "OperatingHours":0.0,
-        "MaintenanceGap":0.0,
-        "Corrosion":0.70,
-        "Pressure":0.60,
-        "Age":0.60
-    },
+# ==============================
+# SCORE FUNCTIONS
+# ==============================
 
-    {
-        "Asset":"C401",
-        "Type":"Compressor",
-        "Criticality":0.9,
-        "Temperature":0.70,
-        "Vibration":0.60,
-        "OperatingHours":0.0,
-        "MaintenanceGap":0.40,
-        "Corrosion":0.0,
-        "Pressure":0.0,
-        "Age":0.50
+def vib_score(v):
+    if v < 3: return 0.1
+    elif v < 4.5: return 0.3
+    elif v < 7: return 0.7
+    return 1.0
+
+
+def temp_score(t):
+    if t < 70: return 0.1
+    elif t < 85: return 0.3
+    elif t < 100: return 0.7
+    return 1.0
+
+
+def pressure_score(p):
+    if p < 0.6: return 0.1
+    elif p < 0.75: return 0.3
+    elif p < 0.9: return 0.7
+    return 1.0
+
+
+def corrosion_score(c):
+    if c < 0.1: return 0.1
+    elif c < 0.3: return 0.3
+    elif c < 0.5: return 0.7
+    return 1.0
+
+
+def maintenance_score(d):
+    if d < 30: return 0.1
+    elif d < 90: return 0.3
+    elif d < 180: return 0.7
+    return 1.0
+
+
+# ==============================
+# ENGINE MODELS
+# ==============================
+
+def compute_pof(asset_type, vals):
+
+    if asset_type == "Pump":
+        return (
+            0.45 * vib_score(vals["vibration"]) +
+            0.35 * temp_score(vals["temperature"]) +
+            0.20 * maintenance_score(vals["maintenance"])
+        )
+
+    elif asset_type == "Pipeline":
+        return (
+            0.45 * corrosion_score(vals["corrosion"]) +
+            0.35 * pressure_score(vals["pressure"]) +
+            0.20 * maintenance_score(vals["maintenance"])
+        )
+
+    elif asset_type == "Tank":
+        return (
+            0.50 * corrosion_score(vals["corrosion"]) +
+            0.20 * corrosion_score(vals["settlement"]) +
+            0.20 * maintenance_score(vals["maintenance"]) +
+            0.10 * corrosion_score(vals["age"])
+        )
+
+    elif asset_type == "Compressor":
+        return (
+            0.40 * vib_score(vals["vibration"]) +
+            0.30 * temp_score(vals["temperature"]) +
+            0.20 * pressure_score(vals["pressure_ratio"]) +
+            0.10 * maintenance_score(vals["maintenance"])
+        )
+
+    return 0
+
+
+def compute_cof(asset_type, criticality):
+
+    base = {
+        "Pump": 0.55,
+        "Pipeline": 0.95,
+        "Tank": 0.70,
+        "Compressor": 0.75
     }
-]
 
-if "asset_data" not in st.session_state:
-    st.session_state.asset_data = pd.DataFrame(DEFAULT_ASSETS)
+    return base[asset_type] * (criticality / 5)
 
-# ==========================================================
-# RESET
-# ==========================================================
 
-def reset_assets():
-    st.session_state.asset_data = pd.DataFrame(DEFAULT_ASSETS)
+def compute_health(pof):
+    return max(0, (1 - pof) * 100)
 
-# ==========================================================
-# RISK MODEL
-# ==========================================================
 
-def compute_pof(row):
+def decision(risk):
+    if risk < 0.2:
+        return "NORMAL"
+    elif risk < 0.4:
+        return "MONITOR"
+    elif risk < 0.6:
+        return "INSPECT"
+    elif risk < 0.8:
+        return "URGENT INSPECTION"
+    return "SHUTDOWN"
 
-    if row["Type"] == "Pump":
-        return (
-            0.35 * row["Vibration"] +
-            0.25 * row["Temperature"] +
-            0.20 * row["OperatingHours"] +
-            0.20 * row["MaintenanceGap"]
-        )
 
-    elif row["Type"] == "Tank":
-        return (
-            0.40 * row["Corrosion"] +
-            0.30 * row["Age"] +
-            0.30 * row["MaintenanceGap"]
-        )
+# ==============================
+# UI — ASSET SELECTION
+# ==============================
+asset_id = st.selectbox("Select Asset", list(assets.keys()))
+asset = assets[asset_id]
 
-    elif row["Type"] == "Pipeline":
-        return (
-            0.35 * row["Corrosion"] +
-            0.25 * row["Pressure"] +
-            0.40 * row["Age"]
-        )
+st.subheader(f"Asset: {asset_id} ({asset['type']})")
 
-    elif row["Type"] == "Compressor":
-        return (
-            0.40 * row["Vibration"] +
-            0.30 * row["Temperature"] +
-            0.30 * row["MaintenanceGap"]
-        )
+# ==============================
+# INPUT MODELS
+# ==============================
 
-    return 0
+if asset["type"] == "Pump":
 
-# ==========================================================
-# CONSEQUENCE MODEL
-# ==========================================================
+    temperature = st.slider("Temperature (°C)", 40, 120, 75)
+    vibration = st.slider("Vibration (mm/s)", 1.0, 10.0, 3.5)
+    maintenance = st.slider("Maintenance Delay (days)", 0, 365, 60)
 
-def compute_consequence(row):
+    values = {
+        "temperature": temperature,
+        "vibration": vibration,
+        "maintenance": maintenance
+    }
 
-    if row["Type"] == "Pump":
-        return 0.54
+elif asset["type"] == "Pipeline":
 
-    elif row["Type"] == "Tank":
-        return 0.71
+    corrosion = st.slider("Corrosion Rate (mm/year)", 0.0, 0.6, 0.2)
+    pressure = st.slider("Pressure Utilization (0-1)", 0.4, 1.2, 0.8)
+    maintenance = st.slider("Maintenance Delay (days)", 0, 365, 60)
 
-    elif row["Type"] == "Pipeline":
-        return 0.815
+    values = {
+        "corrosion": corrosion,
+        "pressure": pressure,
+        "maintenance": maintenance
+    }
 
-    elif row["Type"] == "Compressor":
-        return 0.63
+elif asset["type"] == "Tank":
 
-    return 0
+    corrosion = st.slider("Bottom Corrosion Rate", 0.0, 0.6, 0.2)
+    settlement = st.slider("Settlement Index", 0.0, 1.0, 0.3)
+    maintenance = st.slider("Maintenance Delay (days)", 0, 365, 90)
+    age = st.slider("Age Factor", 0.0, 1.0, 0.5)
 
-# ==========================================================
-# DECISION ENGINE
-# ==========================================================
+    values = {
+        "corrosion": corrosion,
+        "settlement": settlement,
+        "maintenance": maintenance,
+        "age": age
+    }
 
-def classify(risk):
+elif asset["type"] == "Compressor":
 
-    if risk > 0.70:
-        return "CRITICAL", "STOP OPERATION"
+    temperature = st.slider("Temperature (°C)", 40, 130, 80)
+    vibration = st.slider("Vibration (mm/s)", 1.0, 10.0, 4.0)
+    pressure_ratio = st.slider("Pressure Ratio", 1.0, 2.5, 1.5)
+    maintenance = st.slider("Maintenance Delay (days)", 0, 365, 60)
 
-    elif risk > 0.40:
-        return "HIGH", "URGENT INSPECTION"
+    values = {
+        "temperature": temperature,
+        "vibration": vibration,
+        "pressure_ratio": pressure_ratio,
+        "maintenance": maintenance
+    }
 
-    elif risk > 0.20:
-        return "MEDIUM", "MONITOR"
+# ==============================
+# COMPUTATION ENGINE
+# ==============================
 
-    return "LOW", "NORMAL"
+pof = compute_pof(asset["type"], values)
+cof = compute_cof(asset["type"], asset["criticality"])
+risk = pof * cof
+health = compute_health(pof)
+action = decision(risk)
 
-# ==========================================================
-# CALCULATION ENGINE
-# ==========================================================
-
-def calculate_results(df):
-
-    results = []
-
-    for _, row in df.iterrows():
-
-        pof = compute_pof(row)
-
-        consequence = compute_consequence(row)
-
-        risk = pof * consequence * row["Criticality"]
-
-        health = (1 - pof) * 100
-
-        level, action = classify(risk)
-
-        results.append({
-
-            "Asset": row["Asset"],
-            "Type": row["Type"],
-            "PoF": round(pof,3),
-            "Consequence": round(consequence,3),
-            "Risk": round(risk,3),
-            "Health": round(health,1),
-            "Level": level,
-            "Action": action,
-            "Criticality": row["Criticality"]
-
-        })
-
-    return pd.DataFrame(results)
-
-# ==========================================================
-# TITLE
-# ==========================================================
-
-st.title("🛢️ Libya Oil Digital Twin")
-st.caption("Training Prototype v2.0")
-
-# ==========================================================
-# RESET BUTTON
-# ==========================================================
-
-if st.button("Reset Plant"):
-    reset_assets()
-    st.rerun()
-
-# ==========================================================
-# MAIN DATA
-# ==========================================================
-
-assets_df = st.session_state.asset_data.copy()
-
-results = calculate_results(assets_df)
-
-# ==========================================================
-# KPI
-# ==========================================================
+# ==============================
+# DISPLAY KPIs
+# ==============================
 
 col1, col2, col3, col4 = st.columns(4)
 
-col1.metric(
-    "Assets",
-    len(results)
-)
+col1.metric("PoF", round(pof, 3))
+col2.metric("CoF", round(cof, 3))
+col3.metric("Risk", round(risk, 3))
+col4.metric("Health %", round(health, 1))
 
-col2.metric(
-    "Average Risk",
-    round(results["Risk"].mean(),3)
-)
+st.subheader(f"Decision: {action}")
 
-col3.metric(
-    "Highest Risk Asset",
-    results.loc[
-        results["Risk"].idxmax(),
-        "Asset"
-    ]
-)
+# ==============================
+# SAVE TO HISTORY
+# ==============================
+if st.button("Apply & Save Snapshot"):
 
-col4.metric(
-    "Average Health %",
-    round(results["Health"].mean(),1)
-)
+    st.session_state.history.append({
+        "time": datetime.now(),
+        "asset": asset_id,
+        "pof": pof,
+        "cof": cof,
+        "risk": risk,
+        "health": health
+    })
 
-# ==========================================================
-# RISK RANKING
-# ==========================================================
+    st.success("Snapshot saved to history")
 
-st.subheader("📊 Asset Risk Ranking")
+# ==============================
+# HISTORY ANALYTICS
+# ==============================
+if len(st.session_state.history) > 0:
 
-fig1 = px.bar(
-    results.sort_values("Risk"),
-    x="Risk",
-    y="Asset",
-    color="Risk",
-    orientation="h"
-)
+    df = pd.DataFrame(st.session_state.history)
 
-st.plotly_chart(
-    fig1,
-    use_container_width=True
-)
+    st.subheader("Historical Risk Trend")
 
-# ==========================================================
-# TWO COLUMN LAYOUT
-# ==========================================================
+    st.line_chart(df.groupby("asset")["risk"].mean())
 
-left, right = st.columns([2,1])
+    st.subheader("Historical Health Trend")
 
-# ==========================================================
-# RISK MATRIX
-# ==========================================================
+    st.line_chart(df.groupby("asset")["health"].mean())
 
-with left:
+# ==============================
+# SIMPLE FORECAST ENGINE
+# ==============================
 
-    st.subheader("📈 Risk Matrix")
+if len(st.session_state.history) > 5:
 
-    fig2 = px.scatter(
-        results,
-        x="PoF",
-        y="Consequence",
-        size="Risk",
-        color="Type",
-        text="Asset"
-    )
+    st.subheader("30-Day Risk Forecast (Simple Linear Model)")
 
-    st.plotly_chart(
-        fig2,
-        use_container_width=True
-    )
+    df = pd.DataFrame(st.session_state.history)
+    df = df[df["asset"] == asset_id]
 
-# ==========================================================
-# SIMULATOR
-# ==========================================================
+    if len(df) > 2:
 
-with right:
+        df["t"] = np.arange(len(df))
 
-    st.subheader("🧪 Digital Twin Simulator")
+        model = LinearRegression()
+        model.fit(df[["t"]], df["risk"])
 
-    asset_choice = st.selectbox(
-        "Select Asset",
-        assets_df["Asset"]
-    )
+        future = np.array([[len(df) + 30]])
+        pred = model.predict(future)[0]
 
-    selected = assets_df[
-        assets_df["Asset"] == asset_choice
-    ].iloc[0]
-
-    temp = st.slider(
-        "Temperature",
-        0.0,1.0,
-        float(selected["Temperature"])
-    )
-
-    vib = st.slider(
-        "Vibration",
-        0.0,1.0,
-        float(selected["Vibration"])
-    )
-
-    corr = st.slider(
-        "Corrosion",
-        0.0,1.0,
-        float(selected["Corrosion"])
-    )
-
-    pressure = st.slider(
-        "Pressure",
-        0.0,1.0,
-        float(selected["Pressure"])
-    )
-
-    if st.button("Apply Changes"):
-
-        idx = st.session_state.asset_data[
-            st.session_state.asset_data["Asset"]
-            == asset_choice
-        ].index[0]
-
-        st.session_state.asset_data.loc[
-            idx,
-            "Temperature"
-        ] = temp
-
-        st.session_state.asset_data.loc[
-            idx,
-            "Vibration"
-        ] = vib
-
-        st.session_state.asset_data.loc[
-            idx,
-            "Corrosion"
-        ] = corr
-
-        st.session_state.asset_data.loc[
-            idx,
-            "Pressure"
-        ] = pressure
-
-        st.success(
-            f"{asset_choice} updated successfully."
-        )
-
-        st.rerun()
-
-# ==========================================================
-# DECISION CENTER
-# ==========================================================
-
-st.subheader("⚠️ Decision Center")
-
-st.dataframe(
-    results,
-    use_container_width=True
-)
+        st.metric("Forecasted Risk (30 days)", round(pred, 3))
